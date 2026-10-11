@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Corridora React/Go reviews, bounded AWS demo with no VPC/NAT
+Parameters:
+  ArtifactBucket: {Type: String}
+  ArtifactKey: {Type: String}
+  Owner: {Type: String}
+  Version: {Type: String}
+  ConfigRevision: {Type: String, Default: initial}
+  ApiServiceName: {Type: String, Default: sample-reviews-api}
+  Namespace: {Type: String, Default: corridora-samples.reviews}
+  Environment: {Type: String, Default: development}
+  IngestEndpoint: {Type: String, Default: 'https://ingest.corridora.com'}
+  RUMScript: {Type: String, Default: 'https://rum.corridora.com/corridora-rum.js'}
+  RecommenderURL: {Type: String, Default: ''}
+  ExistingSecretArn: {Type: String, Default: ''}
+  DailyStart: {Type: String, Default: '13:20'}
+  DailyExpression: {Type: String, Default: 'cron(20 13 * * ? *)'}
+  WindowSeconds: {Type: String, Default: '600'}
+  EnableSynthetics: {Type: String, AllowedValues: ['true','false'], Default: 'false'}
+  EnableForwarding: {Type: String, AllowedValues: ['true','false'], Default: 'false'}
+Conditions:
+  NewSecret: !Equals [!Ref ExistingSecretArn, '']
+  Synthetics: !Equals [!Ref EnableSynthetics, 'true']
+  Forwarding: !Equals [!Ref EnableForwarding, 'true']
+Resources:
+  Reviews:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: id, AttributeType: S}, {AttributeName: kind, AttributeType: S}, {AttributeName: created, AttributeType: S}]
+      GlobalSecondaryIndexes: [{IndexName: ReviewsByDate, KeySchema: [{AttributeName: kind, KeyType: HASH}, {AttributeName: created, KeyType: RANGE}], Projection: {ProjectionType: ALL}}]
+      KeySchema: [{AttributeName: id, KeyType: HASH}]
+      TimeToLiveSpecification: {AttributeName: expires, Enabled: true}
+      SSESpecification: {SSEEnabled: true}
+      Tags: [{Key: SampleOwner, Value: !Ref Owner}]
+  Thumbnails:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      LifecycleConfiguration: {Rules: [{Id: expire-fixtures, Status: Enabled, ExpirationInDays: 7}]}
+      Tags: [{Key: SampleOwner, Value: !Ref Owner}]
+  ConfigSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: NewSecret
+    Properties: {Description: Dedicated sample-reviews export and control configuration, SecretString: '{}', Tags: [{Key: SampleOwner, Value: !Ref Owner}]}
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties: {MessageRetentionPeriod: 86400, SqsManagedSseEnabled: true, Tags: [{Key: SampleOwner, Value: !Ref Owner}]}
+  ModerationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 30
+      MessageRetentionPeriod: 86400
+      SqsManagedSseEnabled: true
+      RedrivePolicy: {deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn, maxReceiveCount: 3}
+      Tags: [{Key: SampleOwner, Value: !Ref Owner}]
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies:
+        - PolicyName: sample-api
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['logs:CreateLogStream','logs:PutLogEvents'], Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-api:*'}
+              - {Effect: Allow, Action: ['dynamodb:GetItem','dynamodb:PutItem','dynamodb:Query'], Resource: [!GetAtt Reviews.Arn, !Sub '${Reviews.Arn}/index/ReviewsByDate']}
+              - {Effect: Allow, Action: 'sqs:SendMessage', Resource: !GetAtt ModerationQueue.Arn}
+              - {Effect: Allow, Action: ['s3:GetObject','s3:PutObject'], Resource: !Sub '${Thumbnails.Arn}/fixtures/*'}
+              - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !If [NewSecret, !Ref ConfigSecret, !Ref ExistingSecretArn]}
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies:
+        - PolicyName: sample-worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['logs:CreateLogStream','logs:PutLogEvents'], Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-worker:*'}
+              - {Effect: Allow, Action: ['dynamodb:GetItem','dynamodb:PutItem'], Resource: !GetAtt Reviews.Arn}
+              - {Effect: Allow, Action: ['sqs:ReceiveMessage','sqs:DeleteMessage','sqs:GetQueueAttributes'], Resource: !GetAtt ModerationQueue.Arn}
+              - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !If [NewSecret, !Ref ConfigSecret, !Ref ExistingSecretArn]}
+  BridgeRole:
+    Type: AWS::IAM::Role
+    Condition: Forwarding
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies:
+        - PolicyName: sample-bridge
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: ['logs:CreateLogStream','logs:PutLogEvents'], Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-bridge:*'}
+              - {Effect: Allow, Action: 'secretsmanager:GetSecretValue', Resource: !If [NewSecret, !Ref ConfigSecret, !Ref ExistingSecretArn]}
+              - {Effect: Allow, Action: 'cloudwatch:GetMetricData', Resource: '*'}
+              - {Effect: Allow, Action: ['dynamodb:GetItem','dynamodb:PutItem'], Resource: !GetAtt Reviews.Arn}
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ApiLogs
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-api'
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures: [arm64]
+      MemorySize: 128
+      Timeout: 10
+      ReservedConcurrentExecutions: 5
+      Role: !GetAtt ApiRole.Arn
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Ref ArtifactKey}
+      Environment:
+        Variables:
+          SAMPLE_MODE: cloud
+          WEB_ROOT: /var/task/web
+          SERVICE_VERSION: !Ref Version
+          CONFIG_REVISION: !Ref ConfigRevision
+          OTEL_SERVICE_NAME: !Ref ApiServiceName
+          OTEL_SERVICE_NAMESPACE: !Ref Namespace
+          DEPLOYMENT_ENVIRONMENT: !Ref Environment
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          CORRIDORA_OTLP_ENDPOINT: !Ref IngestEndpoint
+          CORRIDORA_RUM_SCRIPT_URL: !Ref RUMScript
+          CONFIG_SECRET_ARN: !If [NewSecret, !Ref ConfigSecret, !Ref ExistingSecretArn]
+          REVIEWS_TABLE: !Ref Reviews
+          MODERATION_QUEUE_URL: !Ref ModerationQueue
+          THUMBNAIL_BUCKET: !Ref Thumbnails
+          RECOMMENDER_URL: !Ref RecommenderURL
+          PUBLIC_ORIGIN: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'
+          DEMO_DAILY_START_UTC: !Ref DailyStart
+          DEMO_WINDOW_SECONDS: !Ref WindowSeconds
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: WorkerLogs
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker'
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures: [arm64]
+      MemorySize: 128
+      Timeout: 5
+      ReservedConcurrentExecutions: 2
+      Role: !GetAtt WorkerRole.Arn
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Ref ArtifactKey}
+      Environment:
+        Variables:
+          SAMPLE_MODE: cloud
+          SERVICE_VERSION: !Ref Version
+          CONFIG_REVISION: !Ref ConfigRevision
+          OTEL_SERVICE_NAME: sample-reviews-worker
+          OTEL_SERVICE_NAMESPACE: !Ref Namespace
+          DEPLOYMENT_ENVIRONMENT: !Ref Environment
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          CORRIDORA_OTLP_ENDPOINT: !Ref IngestEndpoint
+          CONFIG_SECRET_ARN: !If [NewSecret, !Ref ConfigSecret, !Ref ExistingSecretArn]
+          REVIEWS_TABLE: !Ref Reviews
+          MODERATION_QUEUE_URL: !Ref ModerationQueue
+          DEMO_DAILY_START_UTC: !Ref DailyStart
+          DEMO_WINDOW_SECONDS: !Ref WindowSeconds
+  QueueMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties: {EventSourceArn: !GetAtt ModerationQueue.Arn, FunctionName: !Ref WorkerFunction, BatchSize: 1, FunctionResponseTypes: [ReportBatchItemFailures], ScalingConfig: {MaximumConcurrency: 2}}
+  BridgeFunction:
+    Type: AWS::Lambda::Function
+    Condition: Forwarding
+    DependsOn: BridgeLogs
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-bridge'
+      Runtime: provided.al2023
+      Handler: bootstrap
+      Architectures: [arm64]
+      MemorySize: 128
+      Timeout: 15
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt BridgeRole.Arn
+      Code: {S3Bucket: !Ref ArtifactBucket, S3Key: !Ref ArtifactKey}
+      Environment:
+        Variables:
+          SAMPLE_MODE: cloud
+          SERVICE_VERSION: !Ref Version
+          CONFIG_REVISION: !Ref ConfigRevision
+          OTEL_SERVICE_NAME: sample-reviews-cloudwatch
+          OTEL_SERVICE_NAMESPACE: !Ref Namespace
+          DEPLOYMENT_ENVIRONMENT: !Ref Environment
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          CORRIDORA_OTLP_ENDPOINT: !Ref IngestEndpoint
+          CONFIG_SECRET_ARN: !If [NewSecret, !Ref ConfigSecret, !Ref ExistingSecretArn]
+          API_FUNCTION_NAME: !Ref ApiFunction
+          REVIEWS_TABLE: !Ref Reviews
+          DLQ_NAME: !GetAtt DeadLetterQueue.QueueName
+  ApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-api', RetentionInDays: 3}
+  WorkerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-worker', RetentionInDays: 3}
+  BridgeLogs:
+    Type: AWS::Logs::LogGroup
+    Condition: Forwarding
+    Properties: {LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-bridge', RetentionInDays: 3}
+  LogsPermission:
+    Type: AWS::Lambda::Permission
+    Condition: Forwarding
+    Properties: {Action: 'lambda:InvokeFunction', FunctionName: !Ref BridgeFunction, Principal: !Sub 'logs.${AWS::Region}.amazonaws.com', SourceAccount: !Ref AWS::AccountId, SourceArn: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*:*'}
+  ApiLogSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: Forwarding
+    DependsOn: LogsPermission
+    Properties: {DestinationArn: !GetAtt BridgeFunction.Arn, LogGroupName: !Ref ApiLogs, FilterPattern: '?REPORT ?START ?END'}
+  WorkerLogSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: Forwarding
+    DependsOn: LogsPermission
+    Properties: {DestinationArn: !GetAtt BridgeFunction.Arn, LogGroupName: !Ref WorkerLogs, FilterPattern: '?REPORT ?START ?END'}
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties: {Name: !Sub '${AWS::StackName}-http', ProtocolType: HTTP}
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties: {ApiId: !Ref HttpApi, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt ApiFunction.Arn, PayloadFormatVersion: '2.0', TimeoutInMillis: 10000}
+  ApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: {ApiId: !Ref HttpApi, RouteKey: '$default', Target: !Sub 'integrations/${ApiIntegration}'}
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties: {ApiId: !Ref HttpApi, StageName: '$default', AutoDeploy: true, DefaultRouteSettings: {ThrottlingBurstLimit: 10, ThrottlingRateLimit: 5}}
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties: {Action: 'lambda:InvokeFunction', FunctionName: !Ref ApiFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'}
+  ScheduleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: scheduler.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies: [{PolicyName: invoke-owned-functions, PolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Action: 'lambda:InvokeFunction', Resource: !GetAtt ApiFunction.Arn}]}}]
+  BridgeScheduleRole:
+    Type: AWS::IAM::Role
+    Condition: Forwarding
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: scheduler.amazonaws.com}, Action: 'sts:AssumeRole'}]}
+      Policies: [{PolicyName: invoke-bridge, PolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Action: 'lambda:InvokeFunction', Resource: !GetAtt BridgeFunction.Arn}]}}]
+  Daily:
+    Type: AWS::Scheduler::Schedule
+    Condition: Synthetics
+    Properties: {ScheduleExpression: !Ref DailyExpression, ScheduleExpressionTimezone: UTC, FlexibleTimeWindow: {Mode: 'OFF'}, Target: {Arn: !GetAtt ApiFunction.Arn, RoleArn: !GetAtt ScheduleRole.Arn, Input: '{"action":"daily"}', RetryPolicy: {MaximumRetryAttempts: 1, MaximumEventAgeInSeconds: 300}}}
+  Watchdog:
+    Type: AWS::Scheduler::Schedule
+    Condition: Synthetics
+    Properties: {ScheduleExpression: 'cron(0 16 * * ? *)', ScheduleExpressionTimezone: UTC, FlexibleTimeWindow: {Mode: 'OFF'}, Target: {Arn: !GetAtt ApiFunction.Arn, RoleArn: !GetAtt ScheduleRole.Arn, Input: '{"action":"watchdog"}', RetryPolicy: {MaximumRetryAttempts: 1, MaximumEventAgeInSeconds: 300}}}
+  MetricPoll:
+    Type: AWS::Scheduler::Schedule
+    Condition: Forwarding
+    Properties: {ScheduleExpression: 'rate(15 minutes)', FlexibleTimeWindow: {Mode: 'OFF'}, Target: {Arn: !GetAtt BridgeFunction.Arn, RoleArn: !GetAtt BridgeScheduleRole.Arn, Input: '{"action":"metrics"}', RetryPolicy: {MaximumRetryAttempts: 0, MaximumEventAgeInSeconds: 300}}}
+Outputs:
+  URL: {Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}'}
+  SecretArn: {Value: !If [NewSecret, !Ref ConfigSecret, !Ref ExistingSecretArn]}
+  ThumbnailBucket: {Value: !Ref Thumbnails}
+  QueueURL: {Value: !Ref ModerationQueue}
+  DLQURL: {Value: !Ref DeadLetterQueue}
+  ApiFunctionName: {Value: !Ref ApiFunction}

@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Standalone entry point. Python stdlib only; ./setup --help needs no login."""
+import sys
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent / 'scripts'))
+from setup_app import main
+if __name__ == '__main__':
+    try: main()
+    except (ValueError, RuntimeError, KeyboardInterrupt) as exc:
+        print(f'Setup stopped: {exc}', file=sys.stderr)
+        sys.exit(1)

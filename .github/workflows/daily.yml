@@ -1,0 +1,27 @@
+name: Daily browser incident and watchdog
+on:
+  schedule:
+    - cron: '20 13 * * *'
+    - cron: '30 16 * * *'
+  workflow_dispatch:
+permissions: {contents: read}
+concurrency: {group: sample-reviews-synthetic, cancel-in-progress: false}
+jobs:
+  browser:
+    if: vars.ENABLE_SYNTHETICS == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      SAMPLE_URL: ${{ vars.SAMPLE_URL }}
+      DEMO_CONTROL_TOKEN: ${{ secrets.DEMO_CONTROL_TOKEN }}
+      WATCHDOG: ${{ github.event.schedule == '30 16 * * *' && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '24', cache: npm}
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install --with-deps chromium
+      - run: node scripts/journey.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: daily-browser-evidence, path: test-results/, retention-days: 3}

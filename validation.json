@@ -1,0 +1,43 @@
+{
+  "sample": "sample-reviews",
+  "validated_at": "2026-10-11",
+  "go_tests": { "count": 13, "race_detector": true, "passed": true },
+  "setup_tests": { "count": 15, "passed": true },
+  "checks": {
+    "go_vet": "passed",
+    "linux_arm64_lambda_build": "passed",
+    "vite_production_build": "passed",
+    "npm_audit_vulnerabilities": 0,
+    "cfn_lint": "passed (1.57.2)",
+    "python_compile": "passed",
+    "setup_help_and_offline_deploy_plan": "passed"
+  },
+  "browser_acceptance": {
+    "passed": true,
+    "sdk": "actual Corridora RUM bundle, local capture only",
+    "journey": ["healthy submission", "three bounded moderation failures", "healthy control", "recovery"],
+    "matching_client_server_parent_pairs": 65,
+    "captured_logs": 92,
+    "captured_metric_objects": 10,
+    "example_trace_id": "afc60ffcebd719640e25a0357ff17d69",
+    "example_browser_client_span_id": "5701a40f7d820596",
+    "example_go_server_span_id": "069b7531f463b375"
+  },
+  "review_fixes": [
+    "Daily window supports UTC midnight rollover",
+    "Explicit cloud synthetics setup installs owned GitHub workflow variables and control secret after published-workflow preflight",
+    "Cloud verification requires the matching message in the actual owned SQS DLQ",
+    "Incoming unsampled W3C decisions are respected",
+    "CloudWatch source timestamps, event IDs, checkpoint deduplication and metric window semantics are preserved"
+  ],
+  "not_live_verified": [
+    "AWS deployment and IAM permissions",
+    "Actual SQS retries, DLQ delivery and replay",
+    "Scheduler and hosted browser workflow delivery",
+    "CloudWatch subscriptions and native metric collection",
+    "GitHub workflow variable and secret installation",
+    "Tenant-stored Corridora correlation",
+    "Actual cloud billing"
+  ],
+  "external_mutations_performed": false
+}
